@@ -37,7 +37,7 @@ class MusicDataStore {
     // Tolerance for small timing differences (milliseconds)
     private val seekTolerance = 2000L
 
-    private val artworkDelay = 500L
+    private val artworkDelay = 1000L
     private var metadataChangeTimestamp = 0L
     private var artworkCheckPending = false
 

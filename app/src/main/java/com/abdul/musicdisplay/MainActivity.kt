@@ -43,7 +43,7 @@ class MainActivity : ComponentActivity() {
             MaterialTheme {
 
                 val bleManager = remember {
-                    BleConnection.get(this@MainActivity)
+                    BleConnection.get(applicationContext)
                 }
 
                 val discoveredDevices =
@@ -184,6 +184,15 @@ class MainActivity : ComponentActivity() {
                     Text("Status: $status")
 
                     Text("Connection: $connectionState")
+                    Spacer(modifier = Modifier.height(12.dp))
+
+                    Button(
+                        onClick = {
+                            CompanionDeviceSetup.associate(this@MainActivity)
+                        }
+                    ) {
+                        Text("Set up automatic connection")
+                    }
 
                     Spacer(modifier = Modifier.height(16.dp))
 
@@ -264,5 +273,21 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    @Deprecated("Deprecated in Android 13")
+    override fun onActivityResult(
+        requestCode: Int,
+        resultCode: Int,
+        data: android.content.Intent?
+    ) {
+        super.onActivityResult(requestCode, resultCode, data)
+
+        CompanionDeviceSetup.handleLegacyActivityResult(
+            this,
+            requestCode,
+            resultCode,
+            data
+        )
     }
 }
