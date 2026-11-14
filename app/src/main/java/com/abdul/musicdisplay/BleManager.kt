@@ -73,6 +73,12 @@ class BleManager(
     val maxWriteSize: Int
         get() = negotiatedMtu - 3
 
+    var onTransmissionConnectionStateChanged:
+            ((ConnectionState) -> Unit)? = null
+
+    var onTransmissionDataReceived:
+            ((ByteArray) -> Unit)? = null
+
     var connectionState = ConnectionState.DISCONNECTED
         private set
 
@@ -92,6 +98,7 @@ class BleManager(
 
         handler.post {
             onConnectionStateChanged?.invoke(newState)
+            onTransmissionConnectionStateChanged?.invoke(newState)
         }
 
         Log.d(TAG, "Connection state: $newState")
@@ -403,7 +410,9 @@ class BleManager(
             if (characteristic.uuid == TX_CHARACTERISTIC_UUID) {
                 characteristic.value?.let { data ->
                     handler.post {
-                        onDataReceived?.invoke(data.copyOf())
+                        val copy = data.copyOf()
+                        onDataReceived?.invoke(copy)
+                        onTransmissionDataReceived?.invoke(copy)
                     }
                 }
             }
@@ -419,6 +428,7 @@ class BleManager(
 
                 handler.post {
                     onDataReceived?.invoke(data)
+                    onTransmissionDataReceived?.invoke(data)
                 }
             }
         }

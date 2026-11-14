@@ -6,54 +6,59 @@ import android.media.MediaMetadata
 import android.media.session.MediaController
 import android.media.session.MediaSessionManager
 import android.media.session.PlaybackState
-import android.service.notification.NotificationListenerService
-import android.util.Log
 import android.os.Handler
 import android.os.Looper
+import android.service.notification.NotificationListenerService
+import android.util.Log
 
 class MediaListenerService : NotificationListenerService() {
 
+    companion object {
+        private const val TAG = "MusicDisplay"
+    }
+
     private val musicDataStore = MusicDataStore()
 
+    private lateinit var bleManager: BleManager
     private lateinit var transmissionManager: TransmissionManager
 
-    private val dryRunHandler = Handler(Looper.getMainLooper())
+    private val handler = Handler(Looper.getMainLooper())
 
     private val artworkCheckRunnable = Runnable {
-        transmissionManager.onUpdateAvailable()
+        if (::transmissionManager.isInitialized) {
+            transmissionManager.onUpdateAvailable()
+        }
     }
 
     private lateinit var mediaSessionManager: MediaSessionManager
 
-    // Store the callbacks registered to each media session
     private val registeredCallbacks =
         mutableMapOf<MediaController, MediaController.Callback>()
 
-    // The session currently being monitored
     private var currentController: MediaController? = null
 
-    // The latest music information
     var currentMusicData: MusicData? = null
         private set
 
-    // Android calls this when active media sessions change
     private val sessionListener =
         MediaSessionManager.OnActiveSessionsChangedListener { controllers ->
-
-            Log.d("MusicDisplay", "ACTIVE SESSIONS CHANGED!")
-
+            Log.d(TAG, "ACTIVE SESSIONS CHANGED!")
             updateSessions(controllers)
         }
 
     override fun onListenerConnected() {
         super.onListenerConnected()
 
-        Log.d("MusicDisplay", "LISTENER CONNECTED!")
+        Log.d(TAG, "LISTENER CONNECTED!")
+
+        // Retrieve the same BLE manager used by MainActivity.
+        bleManager = BleConnection.get(this)
+
+        // Initialize the transmission pipeline.
+        initializeTransmission()
 
         mediaSessionManager =
             getSystemService(MediaSessionManager::class.java)
-
-        initializeTransmissionDryRun()
 
         val component = ComponentName(
             this,
@@ -66,32 +71,91 @@ class MediaListenerService : NotificationListenerService() {
         )
 
         val sessions = mediaSessionManager.getActiveSessions(component)
-
         updateSessions(sessions)
+    }
+
+    private fun initializeTransmission() {
+
+        transmissionManager = TransmissionManager(
+            dataStore = musicDataStore,
+
+            // Send the encoded protocol packet through real BLE.
+            sendBlePacket = { bytes ->
+                val accepted = bleManager.writePacket(bytes)
+
+                if (accepted) {
+                    Log.d(TAG, "BLE accepted packet: ${bytes.size} bytes")
+                } else {
+                    Log.e(TAG, "BLE rejected packet")
+                }
+
+                accepted
+            },
+
+            // Use the actual negotiated BLE write size.
+            maxWriteSize = {
+                bleManager.maxWriteSize
+            },
+
+            onError = { error ->
+                Log.e(TAG, "Transmission error: $error")
+            }
+        )
+
+        // Route ESP32 notifications (including ACKs) to TransmissionManager.
+        bleManager.onTransmissionDataReceived = { data ->
+            transmissionManager.onPacketReceived(data)
+        }
+
+        // Start or stop transmission according to the actual BLE state.
+        bleManager.onTransmissionConnectionStateChanged = { state ->
+            when (state) {
+                BleManager.ConnectionState.READY -> {
+                    Log.d(TAG, "BLE READY - starting transmission")
+                    transmissionManager.onConnected()
+                }
+
+                BleManager.ConnectionState.DISCONNECTED -> {
+                    Log.d(TAG, "BLE DISCONNECTED")
+                    transmissionManager.onDisconnected()
+                }
+
+                else -> Unit
+            }
+        }
+
+        // Handle the case where BLE was already connected before
+        // the service registered its callbacks.
+        if (bleManager.connectionState == BleManager.ConnectionState.READY) {
+            transmissionManager.onConnected()
+        }
+
+        Log.d(TAG, "Real BLE transmission initialized.")
     }
 
     private fun updateSessions(controllers: List<MediaController>?) {
 
         val activeControllers = controllers.orEmpty()
 
-        // Remove callbacks for sessions that are no longer active
         val removedControllers = registeredCallbacks.keys.filter { oldController ->
-            activeControllers.none { it.sessionToken == oldController.sessionToken }
+            activeControllers.none {
+                it.sessionToken == oldController.sessionToken
+            }
         }
 
         for (controller in removedControllers) {
             val callback = registeredCallbacks.remove(controller)
+
             if (callback != null) {
                 controller.unregisterCallback(callback)
             }
         }
 
-        // Register callbacks only for newly discovered sessions
         for (session in activeControllers) {
 
             if (!registeredCallbacks.containsKey(session)) {
 
-                Log.d("MusicDisplay", "Tracking: ${session.packageName}")
+                Log.d(TAG, "Tracking: ${session.packageName}")
 
                 val callback = object : MediaController.Callback() {
 
@@ -117,12 +181,10 @@ class MediaListenerService : NotificationListenerService() {
             }
         }
 
-        // Prefer a session that is currently playing
         currentController = activeControllers.firstOrNull {
             it.playbackState?.state == PlaybackState.STATE_PLAYING
         } ?: activeControllers.firstOrNull()
 
-        // Read its current information immediately
         currentController?.let {
             updateMusicData(it)
         }
@@ -154,30 +216,21 @@ class MediaListenerService : NotificationListenerService() {
             )
         )
 
-        // Only update our stored object if its contents changed
         if (newData != currentMusicData) {
 
             currentMusicData = newData
 
-            Log.d("MusicDisplay", "MUSIC DATA UPDATED")
-            /*Log.d("MusicDisplay", "Title: ${newData.title}")
-            Log.d("MusicDisplay", "Artist: ${newData.artist}")
-            Log.d("MusicDisplay", "Album: ${newData.album}")
-            Log.d("MusicDisplay", "Duration: ${newData.duration} ms")
-            Log.d("MusicDisplay", "Position: ${newData.position} ms")
-            Log.d("MusicDisplay", "Playback state: ${newData.playbackState}")
-            Log.d("MusicDisplay", "Artwork available: ${newData.artwork != null}")
+            Log.d(TAG, "MUSIC DATA UPDATED")
 
-             */
             musicDataStore.updateIncoming(newData)
 
-            // Schedule an artwork check if metadata recently changed
+            // Allow artwork time to load before checking it.
             musicDataStore.getArtworkCheckDelayRemaining()?.let { delay ->
-                dryRunHandler.removeCallbacks(artworkCheckRunnable)
-                dryRunHandler.postDelayed(artworkCheckRunnable, delay)
+                handler.removeCallbacks(artworkCheckRunnable)
+                handler.postDelayed(artworkCheckRunnable, delay)
             }
 
-            // Process metadata, playback and position immediately
+            // Ask TransmissionManager to process the updated snapshot.
             transmissionManager.onUpdateAvailable()
         }
     }
@@ -187,7 +240,7 @@ class MediaListenerService : NotificationListenerService() {
 
         cleanupSessions()
 
-        Log.d("MusicDisplay", "LISTENER DISCONNECTED!")
+        Log.d(TAG, "LISTENER DISCONNECTED!")
     }
 
     private fun cleanupSessions() {
@@ -200,64 +253,12 @@ class MediaListenerService : NotificationListenerService() {
         currentController = null
         currentMusicData = null
 
+        handler.removeCallbacks(artworkCheckRunnable)
+
         if (::mediaSessionManager.isInitialized) {
             mediaSessionManager.removeOnActiveSessionsChangedListener(
                 sessionListener
             )
         }
-    }
-
-    private fun initializeTransmissionDryRun() {
-
-        transmissionManager = TransmissionManager(
-            dataStore = musicDataStore,
-
-            sendBlePacket = { bytes ->
-
-                val result = PacketProtocol.decode(bytes)
-
-                if (result is PacketProtocol.DecodeResult.Success) {
-
-                    val packet = result.packet
-
-                    Log.d(
-                        "MusicDryRun",
-                        "WOULD SEND: ${packet.type}, " +
-                                "Sequence: ${packet.sequence}, " +
-                                "Payload: ${packet.payload.size} bytes"
-                    )
-
-                    // Simulate an ESP32 acknowledgement.
-                    val simulatedAck = PacketProtocol.encode(
-                        type = PacketProtocol.MessageType.ACK,
-                        sequence = packet.sequence,
-                        payload = byteArrayOf()
-                    )
-
-                    dryRunHandler.postDelayed({
-                        transmissionManager.onPacketReceived(simulatedAck)
-                    }, 50)
-
-                    true
-
-                } else {
-                    Log.e("MusicDryRun", "Outgoing packet failed decoding!")
-                    false
-                }
-            },
-
-            // Simulate a negotiated MTU of 247.
-            // 247 - 3 BLE bytes = 244 bytes per write.
-            maxWriteSize = { 244 },
-
-            onError = { error ->
-                Log.e("MusicDryRun", "Transmission error: $error")
-            }
-        )
-
-        // Simulate the BLE connection becoming ready.
-        transmissionManager.onConnected()
-
-        Log.d("MusicDryRun", "Transmission dry-run initialized.")
     }
 }

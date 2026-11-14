@@ -43,7 +43,7 @@ class MainActivity : ComponentActivity() {
             MaterialTheme {
 
                 val bleManager = remember {
-                    BleManager(this@MainActivity)
+                    BleConnection.get(this@MainActivity)
                 }
 
                 val discoveredDevices =
