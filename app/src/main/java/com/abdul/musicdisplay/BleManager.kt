@@ -209,10 +209,15 @@ class BleManager(context: Context) {
             val device = result.device
 
             try {
+                // Only accept devices advertising this exact name.
+                val advertisedName = result.scanRecord?.deviceName ?: return
+
+                if (advertisedName != "MusicDisplay") return
+
                 val address = device.address
 
                 if (discoveredAddresses.add(address)) {
-                    Log.d(TAG, "Device found: ${device.name}")
+                    Log.d(TAG, "Device found: $advertisedName")
 
                     handler.post {
                         onDeviceFound?.invoke(device, result.rssi)
