@@ -53,14 +53,7 @@ class CompanionService : CompanionDeviceService() {
     }
 
     private fun disconnectFromDisplay() {
-
-        Log.d(TAG, "ESP32 disappeared. Disconnecting.")
-
-        try {
-            BleConnection.get(applicationContext).disconnect()
-        } catch (e: Exception) {
-            Log.e(TAG, "BLE disconnect failed", e)
-        }
+        Log.d(TAG, "ESP32 disappeared. Leaving BLE reconnection to BleManager.")
     }
 
     // Android 12 (API 31) and 12L (API 32)

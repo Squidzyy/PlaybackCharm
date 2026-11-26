@@ -29,6 +29,7 @@ class BleManager(context: Context) {
 
     companion object {
         private const val TAG = "MusicDisplayBLE"
+
         private const val SCAN_PERIOD = 10_000L
         private const val REQUESTED_MTU = 247
         private const val CONNECTION_TIMEOUT = 15_000L
@@ -36,8 +37,10 @@ class BleManager(context: Context) {
 
         private const val RECONNECT_RETRY_DELAY = 2_000L
         private const val RECONNECT_SCAN_PERIOD = 10_000L
+
         private const val PREFS_NAME = "ble_connection_preferences"
         private const val KEY_REMEMBERED_DEVICE = "remembered_device_address"
+        private const val KEY_AUTO_RECONNECT = "auto_reconnect_enabled"
 
         val SERVICE_UUID: UUID =
             UUID.fromString("7d2a0001-8f3b-4c6d-9e10-1234567890ab")
@@ -68,16 +71,16 @@ class BleManager(context: Context) {
         bluetoothManager?.adapter
 
     private val handler = Handler(Looper.getMainLooper())
+
     private val preferences =
         appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
-    private var reconnectScanning = false
-    private var reconnectScanCallback: ScanCallback? = null
-    private var reconnectRunnable: Runnable? = null
-    private var reconnectScanTimeoutRunnable: Runnable? = null
+    // --------------------------------------------------
+    // CONNECTION STATE
+    // --------------------------------------------------
 
-    private var bleScanner: BluetoothLeScanner? = null
-    private var scanning = false
+    var connectionState = ConnectionState.DISCONNECTED
+        private set
 
     private var bluetoothGatt: BluetoothGatt? = null
 
@@ -86,65 +89,41 @@ class BleManager(context: Context) {
 
     private var negotiatedMtu = 23
 
+    private var writeInProgress = false
+    private var waitingForMtu = false
+
+    private var connectionTimeoutRunnable: Runnable? = null
+    private var disconnectTimeoutRunnable: Runnable? = null
+
+    // Manual disconnects and companion-device disappearance
+    // disable automatic reconnection until a new connection is requested.
+    private var autoReconnectEnabled =
+        preferences.getBoolean(KEY_AUTO_RECONNECT, true)
+
+    // --------------------------------------------------
+    // RECONNECTION STATE
+    // --------------------------------------------------
+
+    private var reconnectScanning = false
+    private var reconnectScanCallback: ScanCallback? = null
+    private var reconnectRunnable: Runnable? = null
+    private var reconnectScanTimeoutRunnable: Runnable? = null
+
+    // --------------------------------------------------
+    // MANUAL SCANNING STATE
+    // --------------------------------------------------
+
+    private var bleScanner: BluetoothLeScanner? = null
+    private var scanning = false
+
     private val discoveredAddresses = mutableSetOf<String>()
 
     private val scanTimeoutRunnable = Runnable {
         stopScan()
     }
 
-    private var connectionTimeoutRunnable: Runnable? = null
-    private var disconnectTimeoutRunnable: Runnable? = null
-
     // --------------------------------------------------
-    // BLUETOOTH STATE MONITORING
-    // --------------------------------------------------
-
-    private val bluetoothStateReceiver = object : BroadcastReceiver() {
-
-        override fun onReceive(context: Context?, intent: Intent?) {
-            if (intent?.action != BluetoothAdapter.ACTION_STATE_CHANGED) {
-                return
-            }
-
-            when (
-                intent.getIntExtra(
-                    BluetoothAdapter.EXTRA_STATE,
-                    BluetoothAdapter.ERROR
-                )
-            ) {
-                BluetoothAdapter.STATE_TURNING_OFF,
-                BluetoothAdapter.STATE_OFF -> {
-                    Log.w(TAG, "Bluetooth disabled. Releasing GATT.")
-
-                    stopScan()
-                    closeGatt()
-                }
-
-                BluetoothAdapter.STATE_ON -> {
-                    Log.d(TAG, "Bluetooth enabled. Ready for connections.")
-                    scheduleReconnect()
-                }
-            }
-        }
-    }
-
-    init {
-        val filter = IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED)
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            appContext.registerReceiver(
-                bluetoothStateReceiver,
-                filter,
-                Context.RECEIVER_EXPORTED
-            )
-        } else {
-            @Suppress("DEPRECATION")
-            appContext.registerReceiver(bluetoothStateReceiver, filter)
-        }
-    }
-
-    // --------------------------------------------------
-    // CALLBACKS AND STATE
+    // CALLBACKS
     // --------------------------------------------------
 
     var onTransmissionConnectionStateChanged:
@@ -152,9 +131,6 @@ class BleManager(context: Context) {
 
     var onTransmissionDataReceived:
             ((ByteArray) -> Unit)? = null
-
-    var connectionState = ConnectionState.DISCONNECTED
-        private set
 
     var onDeviceFound: ((BluetoothDevice, Int) -> Unit)? = null
     var onScanFailed: ((Int) -> Unit)? = null
@@ -181,6 +157,17 @@ class BleManager(context: Context) {
         }
     }
 
+    private fun reportError(message: String) {
+        Log.e(TAG, message)
+        handler.post {
+            onError?.invoke(message)
+        }
+    }
+
+    // --------------------------------------------------
+    // PERMISSIONS
+    // --------------------------------------------------
+
     fun hasRequiredPermissions(): Boolean {
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             appContext.checkSelfPermission(
@@ -197,7 +184,67 @@ class BleManager(context: Context) {
     }
 
     // --------------------------------------------------
-    // SCANNING
+    // BLUETOOTH STATE MONITORING
+    // --------------------------------------------------
+
+    private val bluetoothStateReceiver = object : BroadcastReceiver() {
+
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action != BluetoothAdapter.ACTION_STATE_CHANGED) {
+                return
+            }
+
+            when (
+                intent.getIntExtra(
+                    BluetoothAdapter.EXTRA_STATE,
+                    BluetoothAdapter.ERROR
+                )
+            ) {
+                BluetoothAdapter.STATE_TURNING_OFF,
+                BluetoothAdapter.STATE_OFF -> {
+                    Log.w(TAG, "Bluetooth disabled. Releasing GATT.")
+
+                    stopScan()
+                    cancelReconnectWork()
+                    closeGatt()
+                }
+
+                BluetoothAdapter.STATE_ON -> {
+                    Log.d(TAG, "Bluetooth enabled.")
+
+                    if (autoReconnectEnabled) {
+                        scheduleReconnect()
+                    }
+                }
+            }
+        }
+    }
+
+    init {
+        val filter = IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED)
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            appContext.registerReceiver(
+                bluetoothStateReceiver,
+                filter,
+                Context.RECEIVER_EXPORTED
+            )
+        } else {
+            @Suppress("DEPRECATION")
+            appContext.registerReceiver(bluetoothStateReceiver, filter)
+        }
+
+        // Resume reconnect attempts after the manager is recreated,
+        // provided the user has not intentionally disabled them.
+        handler.post {
+            if (autoReconnectEnabled) {
+                scheduleReconnect()
+            }
+        }
+    }
+
+    // --------------------------------------------------
+    // MANUAL SCANNING
     // --------------------------------------------------
 
     private val scanCallback = object : ScanCallback() {
@@ -209,7 +256,6 @@ class BleManager(context: Context) {
             val device = result.device
 
             try {
-                // Only accept devices advertising this exact name.
                 val advertisedName = result.scanRecord?.deviceName ?: return
 
                 if (advertisedName != "MusicDisplay") return
@@ -245,28 +291,27 @@ class BleManager(context: Context) {
         if (scanning) return
 
         if (!hasRequiredPermissions()) {
-            Log.e(TAG, "Bluetooth permissions not granted")
-            onError?.invoke("Bluetooth permissions not granted")
+            reportError("Bluetooth permissions not granted")
             return
         }
 
         val adapter = bluetoothAdapter
 
         if (adapter == null) {
-            onError?.invoke("Bluetooth not supported")
+            reportError("Bluetooth not supported")
             return
         }
 
         try {
             if (!adapter.isEnabled) {
-                onError?.invoke("Bluetooth is disabled")
+                reportError("Bluetooth is disabled")
                 return
             }
 
             bleScanner = adapter.bluetoothLeScanner
 
             if (bleScanner == null) {
-                onError?.invoke("BLE scanner unavailable")
+                reportError("BLE scanner unavailable")
                 return
             }
 
@@ -279,14 +324,11 @@ class BleManager(context: Context) {
 
             Log.d(TAG, "BLE scan started")
 
-            handler.postDelayed(
-                scanTimeoutRunnable,
-                SCAN_PERIOD
-            )
+            handler.postDelayed(scanTimeoutRunnable, SCAN_PERIOD)
 
         } catch (e: SecurityException) {
             Log.e(TAG, "Unable to start BLE scan", e)
-            onError?.invoke("Unable to start BLE scan")
+            reportError("Unable to start BLE scan")
         }
     }
 
@@ -298,10 +340,8 @@ class BleManager(context: Context) {
         try {
             bleScanner?.stopScan(scanCallback)
             Log.d(TAG, "BLE scan stopped")
-
         } catch (e: SecurityException) {
             Log.e(TAG, "Unable to stop BLE scan", e)
-
         } finally {
             scanning = false
             onScanStateChanged?.invoke(false)
@@ -312,9 +352,10 @@ class BleManager(context: Context) {
     // CONNECTION
     // --------------------------------------------------
 
-
     fun connectToDevice(device: BluetoothDevice) {
-        // Remember the first manually selected device.
+        // A new explicit connection request re-enables reconnecting.
+        setAutoReconnectEnabled(true)
+
         preferences.edit()
             .putString(KEY_REMEMBERED_DEVICE, device.address)
             .apply()
@@ -324,37 +365,34 @@ class BleManager(context: Context) {
         connectToDeviceInternal(device)
     }
 
-
     fun connectToDeviceInternal(device: BluetoothDevice) {
         cancelReconnectWork()
 
         if (!hasRequiredPermissions()) {
-            onError?.invoke("Bluetooth permissions not granted")
+            reportError("Bluetooth permissions not granted")
             return
         }
 
         val adapter = bluetoothAdapter
 
         if (adapter == null || !adapter.isEnabled) {
-            onError?.invoke("Bluetooth is disabled or unavailable")
+            reportError("Bluetooth is disabled or unavailable")
             return
         }
 
-        // Do not create another connection while one is active.
         if (bluetoothGatt != null) {
             if (connectionState != ConnectionState.DISCONNECTED) {
                 Log.w(TAG, "Connection already active or in progress")
-                onError?.invoke(
+                reportError(
                     "Disconnect from the current device before connecting again"
                 )
                 return
             }
 
-            // Release any leftover GATT object.
-            closeGatt()
+            // Release an old GATT without scheduling another reconnect.
+            closeGatt(bluetoothGatt, shouldReconnect = false)
         }
 
-        // Recover from an inconsistent state.
         if (connectionState != ConnectionState.DISCONNECTED) {
             updateConnectionState(ConnectionState.DISCONNECTED)
         }
@@ -376,13 +414,13 @@ class BleManager(context: Context) {
             if (newGatt == null) {
                 Log.e(TAG, "connectGatt returned null")
                 updateConnectionState(ConnectionState.DISCONNECTED)
-                onError?.invoke("Unable to create BLE connection")
+                reportError("Unable to create BLE connection")
+                scheduleReconnect()
                 return
             }
 
             bluetoothGatt = newGatt
 
-            // Prevent an attempt from remaining CONNECTING indefinitely.
             val timeout = Runnable {
                 if (
                     bluetoothGatt === newGatt &&
@@ -390,68 +428,79 @@ class BleManager(context: Context) {
                 ) {
                     Log.e(TAG, "GATT connection timed out")
 
-                    onError?.invoke("BLE connection timed out")
+                    reportError("BLE connection timed out")
                     closeGatt(newGatt)
                 }
             }
 
             connectionTimeoutRunnable = timeout
-
-            handler.postDelayed(
-                timeout,
-                CONNECTION_TIMEOUT
-            )
+            handler.postDelayed(timeout, CONNECTION_TIMEOUT)
 
         } catch (e: SecurityException) {
             Log.e(TAG, "Unable to connect", e)
             closeGatt()
-            onError?.invoke("Unable to connect to device")
+            reportError("Unable to connect to device")
 
         } catch (e: Exception) {
             Log.e(TAG, "Unexpected connection error", e)
             closeGatt()
-            onError?.invoke("Unexpected BLE connection error: ${e.message}")
+            reportError("Unexpected BLE connection error: ${e.message}")
         }
     }
 
     fun disconnect() {
+        // This is an intentional disconnect. Do not reconnect until
+        // connectToDevice() is explicitly called again.
+        setAutoReconnectEnabled(false)
+        cancelReconnectWork()
+
         val gatt = bluetoothGatt
 
         if (gatt == null) {
-            closeGatt()
+            closeGatt(shouldReconnect = false)
             return
         }
 
-        Log.d(TAG, "Disconnect requested")
+        Log.d(TAG, "Intentional disconnect requested")
 
         try {
             gatt.disconnect()
 
-            // Android should normally deliver STATE_DISCONNECTED.
-            // Force cleanup if that callback never arrives.
             val timeout = Runnable {
                 if (bluetoothGatt === gatt) {
                     Log.w(TAG, "Disconnect callback timed out. Forcing cleanup.")
-                    closeGatt(gatt)
+                    closeGatt(gatt, shouldReconnect = false)
                 }
             }
 
             disconnectTimeoutRunnable = timeout
-
-            handler.postDelayed(
-                timeout,
-                DISCONNECT_TIMEOUT
-            )
+            handler.postDelayed(timeout, DISCONNECT_TIMEOUT)
 
         } catch (e: SecurityException) {
             Log.e(TAG, "Unable to disconnect", e)
-            closeGatt(gatt)
+            closeGatt(gatt, shouldReconnect = false)
+        }
+    }
+
+    private fun setAutoReconnectEnabled(enabled: Boolean) {
+        if (autoReconnectEnabled == enabled) return
+
+        autoReconnectEnabled = enabled
+
+        preferences.edit()
+            .putBoolean(KEY_AUTO_RECONNECT, enabled)
+            .apply()
+
+        Log.d(TAG, "Automatic reconnection enabled: $enabled")
+
+        if (!enabled) {
+            cancelReconnectWork()
         }
     }
 
     // --------------------------------------------------
-// AUTOMATIC RECONNECTION
-// --------------------------------------------------
+    // AUTOMATIC RECONNECTION
+    // --------------------------------------------------
 
     private fun cancelReconnectWork() {
         reconnectRunnable?.let {
@@ -481,9 +530,16 @@ class BleManager(context: Context) {
 
         reconnectScanning = false
         reconnectScanCallback = null
+
+        reconnectScanTimeoutRunnable?.let {
+            handler.removeCallbacks(it)
+        }
+        reconnectScanTimeoutRunnable = null
     }
 
     private fun scheduleReconnect() {
+        if (!autoReconnectEnabled) return
+
         val address = preferences.getString(KEY_REMEMBERED_DEVICE, null)
             ?: return
 
@@ -500,20 +556,21 @@ class BleManager(context: Context) {
 
         val retry = Runnable {
             reconnectRunnable = null
-            startReconnectScan(address)
+
+            if (autoReconnectEnabled) {
+                startReconnectScan(address)
+            }
         }
 
         reconnectRunnable = retry
 
-        handler.postDelayed(
-            retry,
-            RECONNECT_RETRY_DELAY
-        )
+        handler.postDelayed(retry, RECONNECT_RETRY_DELAY)
 
         Log.d(TAG, "Reconnect scheduled for $address")
     }
 
     private fun startReconnectScan(targetAddress: String) {
+        if (!autoReconnectEnabled) return
         if (connectionState != ConnectionState.DISCONNECTED) return
         if (bluetoothGatt != null) return
 
@@ -554,7 +611,6 @@ class BleManager(context: Context) {
                     return
                 }
 
-                // Ignore every device except the one manually selected.
                 if (!address.equals(targetAddress, ignoreCase = true)) {
                     return
                 }
@@ -565,6 +621,7 @@ class BleManager(context: Context) {
 
                 handler.post {
                     if (
+                        autoReconnectEnabled &&
                         connectionState == ConnectionState.DISCONNECTED &&
                         bluetoothGatt == null
                     ) {
@@ -577,9 +634,7 @@ class BleManager(context: Context) {
             override fun onScanFailed(errorCode: Int) {
                 Log.e(TAG, "Reconnect scan failed: $errorCode")
 
-                reconnectScanning = false
-                reconnectScanCallback = null
-
+                stopReconnectScan()
                 scheduleReconnect()
             }
         }
@@ -598,38 +653,32 @@ class BleManager(context: Context) {
                 stopReconnectScan()
 
                 Log.d(TAG, "ESP32 not found. Retrying scan.")
-
                 scheduleReconnect()
             }
 
             reconnectScanTimeoutRunnable = timeout
-
-            handler.postDelayed(
-                timeout,
-                RECONNECT_SCAN_PERIOD
-            )
+            handler.postDelayed(timeout, RECONNECT_SCAN_PERIOD)
 
         } catch (e: SecurityException) {
-            reconnectScanning = false
-            reconnectScanCallback = null
-
+            stopReconnectScan()
             Log.e(TAG, "Reconnect scan permission error", e)
             scheduleReconnect()
 
         } catch (e: Exception) {
-            reconnectScanning = false
-            reconnectScanCallback = null
-
+            stopReconnectScan()
             Log.e(TAG, "Unable to start reconnect scan", e)
             scheduleReconnect()
         }
     }
+
     // --------------------------------------------------
     // GATT CLEANUP
     // --------------------------------------------------
 
-    private fun closeGatt(gatt: BluetoothGatt? = bluetoothGatt) {
-
+    private fun closeGatt(
+        gatt: BluetoothGatt? = bluetoothGatt,
+        shouldReconnect: Boolean = true
+    ) {
         if (gatt == null) {
             cancelConnectionTimeout()
             cancelDisconnectTimeout()
@@ -637,16 +686,22 @@ class BleManager(context: Context) {
             bluetoothGatt = null
             rxCharacteristic = null
             txCharacteristic = null
+
             negotiatedMtu = 23
+            writeInProgress = false
+            waitingForMtu = false
 
             updateConnectionState(ConnectionState.DISCONNECTED)
-            scheduleReconnect()
+
+            if (shouldReconnect) {
+                scheduleReconnect()
+            }
+
             return
         }
 
         val isCurrentConnection = bluetoothGatt === gatt
 
-        // Only the current GATT is allowed to modify manager state.
         if (isCurrentConnection) {
             bluetoothGatt = null
 
@@ -655,12 +710,14 @@ class BleManager(context: Context) {
 
             rxCharacteristic = null
             txCharacteristic = null
+
             negotiatedMtu = 23
+            writeInProgress = false
+            waitingForMtu = false
 
             updateConnectionState(ConnectionState.DISCONNECTED)
         }
 
-        // Close the actual Android GATT object.
         try {
             gatt.close()
         } catch (e: SecurityException) {
@@ -669,7 +726,10 @@ class BleManager(context: Context) {
 
         if (isCurrentConnection) {
             Log.d(TAG, "GATT resources released.")
-            scheduleReconnect()
+
+            if (shouldReconnect) {
+                scheduleReconnect()
+            }
         } else {
             Log.d(TAG, "Closed obsolete GATT connection.")
         }
@@ -718,21 +778,14 @@ class BleManager(context: Context) {
 
             if (status != BluetoothGatt.GATT_SUCCESS) {
                 Log.e(TAG, "GATT connection error: $status")
-
-                onError?.let { callback ->
-                    handler.post {
-                        callback("GATT connection error: $status")
-                    }
-                }
-
+                reportError("GATT connection error: $status")
                 closeGatt(gatt)
                 return
             }
 
             when (newState) {
-
                 BluetoothProfile.STATE_CONNECTED -> {
-                    Log.d(TAG, "Connected! Discovering services...")
+                    Log.d(TAG, "Connected. Discovering services...")
 
                     cancelConnectionTimeout()
                     cancelDisconnectTimeout()
@@ -741,8 +794,7 @@ class BleManager(context: Context) {
 
                     try {
                         if (!gatt.discoverServices()) {
-                            Log.e(TAG, "Service discovery could not be started")
-                            onError?.invoke("Could not start service discovery")
+                            reportError("Could not start service discovery")
                             closeGatt(gatt)
                         }
                     } catch (e: SecurityException) {
@@ -753,7 +805,6 @@ class BleManager(context: Context) {
 
                 BluetoothProfile.STATE_DISCONNECTED -> {
                     Log.d(TAG, "Device disconnected")
-
                     closeGatt(gatt)
                 }
             }
@@ -766,8 +817,7 @@ class BleManager(context: Context) {
             if (!isCurrentGatt(gatt)) return
 
             if (status != BluetoothGatt.GATT_SUCCESS) {
-                Log.e(TAG, "Service discovery failed: $status")
-                onError?.invoke("Service discovery failed")
+                reportError("Service discovery failed: $status")
                 closeGatt(gatt)
                 return
             }
@@ -775,8 +825,7 @@ class BleManager(context: Context) {
             val service = gatt.getService(SERVICE_UUID)
 
             if (service == null) {
-                Log.e(TAG, "Music Display service not found")
-                onError?.invoke("Music Display service not found")
+                reportError("Music Display service not found")
                 closeGatt(gatt)
                 return
             }
@@ -788,25 +837,32 @@ class BleManager(context: Context) {
                 service.getCharacteristic(TX_CHARACTERISTIC_UUID)
 
             if (rxCharacteristic == null || txCharacteristic == null) {
-                Log.e(TAG, "Required characteristics not found")
-                onError?.invoke("Required characteristics not found")
+                reportError("Required characteristics not found")
                 closeGatt(gatt)
                 return
             }
 
             Log.d(TAG, "Required GATT characteristics found")
 
-            try {
-                val mtuRequested = gatt.requestMtu(REQUESTED_MTU)
+            // Do not start notification descriptor writing yet.
+            // First finish MTU negotiation.
+            waitingForMtu = true
 
-                if (!mtuRequested) {
+            try {
+                val started = gatt.requestMtu(REQUESTED_MTU)
+
+                if (!started) {
                     Log.w(TAG, "MTU request could not be started")
+                    waitingForMtu = false
+                    enableNotifications(gatt)
+                } else {
+                    Log.d(TAG, "MTU negotiation requested")
                 }
             } catch (e: SecurityException) {
                 Log.e(TAG, "Unable to request MTU", e)
+                waitingForMtu = false
+                enableNotifications(gatt)
             }
-
-            enableNotifications(gatt)
         }
 
         override fun onMtuChanged(
@@ -819,9 +875,17 @@ class BleManager(context: Context) {
             if (status == BluetoothGatt.GATT_SUCCESS) {
                 negotiatedMtu = mtu
                 Log.d(TAG, "Negotiated MTU: $mtu")
-                onMtuChanged?.invoke(mtu)
+                handler.post {
+                    onMtuChanged?.invoke(mtu)
+                }
             } else {
-                Log.w(TAG, "MTU negotiation failed; using $negotiatedMtu")
+                negotiatedMtu = 23
+                Log.w(TAG, "MTU negotiation failed; using default MTU")
+            }
+
+            if (waitingForMtu) {
+                waitingForMtu = false
+                enableNotifications(gatt)
             }
         }
 
@@ -838,7 +902,7 @@ class BleManager(context: Context) {
                 updateConnectionState(ConnectionState.READY)
             } else {
                 Log.e(TAG, "Failed to enable notifications: $status")
-                onError?.invoke("Failed to enable ESP32 notifications")
+                reportError("Failed to enable ESP32 notifications")
                 closeGatt(gatt)
             }
         }
@@ -851,13 +915,8 @@ class BleManager(context: Context) {
             if (!isCurrentGatt(gatt)) return
 
             if (characteristic.uuid == TX_CHARACTERISTIC_UUID) {
-                characteristic.value?.let { data ->
-                    val copy = data.copyOf()
-
-                    handler.post {
-                        onDataReceived?.invoke(copy)
-                        onTransmissionDataReceived?.invoke(copy)
-                    }
+                characteristic.value?.let { value ->
+                    dispatchReceivedData(value.copyOf())
                 }
             }
         }
@@ -870,12 +929,7 @@ class BleManager(context: Context) {
             if (!isCurrentGatt(gatt)) return
 
             if (characteristic.uuid == TX_CHARACTERISTIC_UUID) {
-                val data = value.copyOf()
-
-                handler.post {
-                    onDataReceived?.invoke(data)
-                    onTransmissionDataReceived?.invoke(data)
-                }
+                dispatchReceivedData(value.copyOf())
             }
         }
 
@@ -885,18 +939,28 @@ class BleManager(context: Context) {
             status: Int
         ) {
             if (!isCurrentGatt(gatt)) return
+            if (characteristic.uuid != RX_CHARACTERISTIC_UUID) return
+
+            writeInProgress = false
 
             if (status == BluetoothGatt.GATT_SUCCESS) {
-                Log.d(TAG, "Packet written successfully")
+                Log.d(TAG, "Packet write completed")
             } else {
                 Log.e(TAG, "Characteristic write failed: $status")
-                onError?.invoke("BLE packet write failed: $status")
+                reportError("BLE packet write failed: $status")
             }
         }
     }
 
+    private fun dispatchReceivedData(data: ByteArray) {
+        handler.post {
+            onDataReceived?.invoke(data)
+            onTransmissionDataReceived?.invoke(data)
+        }
+    }
+
     // --------------------------------------------------
-    // NOTIFICATIONS
+    // NOTIFICATION SETUP
     // --------------------------------------------------
 
     private fun enableNotifications(gatt: BluetoothGatt) {
@@ -905,7 +969,7 @@ class BleManager(context: Context) {
         val characteristic = txCharacteristic
 
         if (characteristic == null) {
-            onError?.invoke("TX characteristic unavailable")
+            reportError("TX characteristic unavailable")
             closeGatt(gatt)
             return
         }
@@ -917,7 +981,7 @@ class BleManager(context: Context) {
             )
 
             if (!enabled) {
-                onError?.invoke("Could not enable local notifications")
+                reportError("Could not enable local notifications")
                 closeGatt(gatt)
                 return
             }
@@ -925,24 +989,21 @@ class BleManager(context: Context) {
             val descriptor = characteristic.getDescriptor(CCCD_UUID)
 
             if (descriptor == null) {
-                onError?.invoke("Notification descriptor not found")
+                reportError("Notification descriptor not found")
                 closeGatt(gatt)
                 return
             }
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-
                 val result = gatt.writeDescriptor(
                     descriptor,
                     BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
                 )
 
                 if (result != BluetoothStatusCodes.SUCCESS) {
-                    Log.e(TAG, "Could not configure notifications: $result")
-                    onError?.invoke("Could not configure notifications")
+                    reportError("Could not configure notifications: $result")
                     closeGatt(gatt)
                 }
-
             } else {
                 @Suppress("DEPRECATION")
                 descriptor.value =
@@ -952,14 +1013,14 @@ class BleManager(context: Context) {
                 val success = gatt.writeDescriptor(descriptor)
 
                 if (!success) {
-                    onError?.invoke("Could not configure notifications")
+                    reportError("Could not configure notifications")
                     closeGatt(gatt)
                 }
             }
 
         } catch (e: SecurityException) {
             Log.e(TAG, "Notification setup failed", e)
-            onError?.invoke("Notification setup failed")
+            reportError("Notification setup failed")
             closeGatt(gatt)
         }
     }
@@ -969,7 +1030,6 @@ class BleManager(context: Context) {
     // --------------------------------------------------
 
     fun writePacket(data: ByteArray): Boolean {
-
         if (connectionState != ConnectionState.READY) {
             Log.e(TAG, "Cannot write: GATT is not ready")
             return false
@@ -978,8 +1038,16 @@ class BleManager(context: Context) {
         val gatt = bluetoothGatt ?: return false
         val characteristic = rxCharacteristic ?: return false
 
+        if (writeInProgress) {
+            Log.w(TAG, "Cannot write: another GATT write is in progress")
+            return false
+        }
+
         if (data.size > negotiatedMtu - 3) {
-            Log.e(TAG, "Packet too large for negotiated MTU")
+            Log.e(
+                TAG,
+                "Packet too large: ${data.size} bytes; maximum is ${negotiatedMtu - 3}"
+            )
             return false
         }
 
@@ -992,20 +1060,17 @@ class BleManager(context: Context) {
                     BluetoothGattCharacteristic.PROPERTY_WRITE != 0
                 ) {
                     BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-
                 } else if (
                     properties and
                     BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE != 0
                 ) {
                     BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
-
                 } else {
-                    onError?.invoke("ESP32 RX characteristic is not writable")
+                    reportError("ESP32 RX characteristic is not writable")
                     return false
                 }
 
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-
+            val started = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 val result = gatt.writeCharacteristic(
                     characteristic,
                     data,
@@ -1013,7 +1078,6 @@ class BleManager(context: Context) {
                 )
 
                 result == BluetoothStatusCodes.SUCCESS
-
             } else {
                 @Suppress("DEPRECATION")
                 characteristic.writeType = writeType
@@ -1024,6 +1088,14 @@ class BleManager(context: Context) {
                 @Suppress("DEPRECATION")
                 gatt.writeCharacteristic(characteristic)
             }
+
+            if (started) {
+                writeInProgress = true
+            } else {
+                Log.w(TAG, "Android rejected GATT write request")
+            }
+
+            started
 
         } catch (e: SecurityException) {
             Log.e(TAG, "Packet write permission error", e)
