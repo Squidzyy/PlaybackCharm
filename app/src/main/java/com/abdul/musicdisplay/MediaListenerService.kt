@@ -24,11 +24,26 @@ class MediaListenerService : NotificationListenerService() {
 
     private val handler = Handler(Looper.getMainLooper())
 
-    private val artworkCheckRunnable = Runnable {
-        if (::transmissionManager.isInitialized) {
-            transmissionManager.onUpdateAvailable()
+
+    private val artworkCheckRunnable = object : Runnable {
+
+        override fun run() {
+
+            if (!::transmissionManager.isInitialized) {
+                return
+            }
+
+            // IMPORTANT: Read the media session again.
+            // Previously, this only checked the old MusicDataStore snapshot.
+            currentController?.let { controller ->
+                updateMusicData(controller)
+            }
+
+            // Keep polling while the current track has no artwork.
+            scheduleArtworkCheck()
         }
     }
+
 
     private lateinit var mediaSessionManager: MediaSessionManager
 
@@ -72,6 +87,19 @@ class MediaListenerService : NotificationListenerService() {
 
         val sessions = mediaSessionManager.getActiveSessions(component)
         updateSessions(sessions)
+    }
+
+    private fun scheduleArtworkCheck() {
+
+        handler.removeCallbacks(artworkCheckRunnable)
+
+        musicDataStore.getArtworkCheckDelayRemaining()?.let { delay ->
+
+            handler.postDelayed(
+                artworkCheckRunnable,
+                delay
+            )
+        }
     }
 
     private fun initializeTransmission() {
@@ -224,11 +252,7 @@ class MediaListenerService : NotificationListenerService() {
 
             musicDataStore.updateIncoming(newData)
 
-            // Allow artwork time to load before checking it.
-            musicDataStore.getArtworkCheckDelayRemaining()?.let { delay ->
-                handler.removeCallbacks(artworkCheckRunnable)
-                handler.postDelayed(artworkCheckRunnable, delay)
-            }
+            scheduleArtworkCheck()
 
             // Ask TransmissionManager to process the updated snapshot.
             transmissionManager.onUpdateAvailable()

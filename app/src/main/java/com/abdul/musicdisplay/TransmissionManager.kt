@@ -20,12 +20,20 @@ class TransmissionManager(
 
     companion object {
         private const val TAG = "MusicTransmission"
+
+        private const val ARTWORK_RETRY_DELAY = 1000L
         private const val ACK_TIMEOUT = 3000L
         private const val MAX_RETRIES = 3
         private const val ARTWORK_SIZE = 150
         private const val JPEG_QUALITY = 85
     }
 
+    private val artworkRetryRunnable = Runnable {
+        if (connected && !transmitting) {
+            Log.d(TAG, "Retrying artwork transmission.")
+            processPendingUpdate()
+        }
+    }
     private data class QueuedPacket(
         val sequence: Int,
         val bytes: ByteArray
@@ -48,9 +56,9 @@ class TransmissionManager(
     // Called when BLE connection becomes READY.
     fun onConnected() {
         handler.post {
-            connected = true
+            handler.removeCallbacks(artworkRetryRunnable)
 
-            // Force a complete synchronization with the ESP32.
+            connected = true
             dataStore.resetTransmissionState()
 
             Log.d(TAG, "Connected. Starting synchronization.")
@@ -64,6 +72,7 @@ class TransmissionManager(
             connected = false
 
             cancelTimeout()
+            handler.removeCallbacks(artworkRetryRunnable)
 
             packetQueue.clear()
             currentPacket = null
@@ -409,7 +418,10 @@ class TransmissionManager(
         val completedBatch = currentBatch
 
         if (completedBatch != null) {
-            dataStore.acknowledgeTransmission(completedBatch.snapshot)
+            dataStore.acknowledgeTransmission(
+                completedBatch.snapshot,
+                completedBatch.changes
+            )
         }
 
         Log.d(TAG, "Transmission batch completed.")
@@ -426,7 +438,11 @@ class TransmissionManager(
     }
 
     private fun failBatch(reason: String) {
+
         cancelTimeout()
+
+        // Remember whether this failed batch included artwork.
+        val retryArtwork = currentBatch?.changes?.artworkChanged == true
 
         Log.e(TAG, reason)
 
@@ -437,7 +453,22 @@ class TransmissionManager(
         transmitting = false
         retryCount = 0
 
-        // Do not acknowledge the snapshot. The datastore retains the update.
+        // Do not acknowledge the snapshot.
+        // The datastore therefore continues to consider the artwork pending.
         onError(reason)
+
+        if (retryArtwork && connected) {
+
+            Log.w(
+                TAG,
+                "Artwork transmission failed. Retrying in ${ARTWORK_RETRY_DELAY}ms."
+            )
+
+            handler.removeCallbacks(artworkRetryRunnable)
+            handler.postDelayed(
+                artworkRetryRunnable,
+                ARTWORK_RETRY_DELAY
+            )
+        }
     }
 }
